@@ -1,0 +1,6 @@
+{
+  "web": {
+    "home_url": "https://your-authorized-portal.example/",
+    "search_url": "https://your-authorized-portal.example/path/to/search"
+  }
+}
