@@ -124,6 +124,34 @@ CATEGORIES = {
     },
 }
 
+
+def _ordered_generated_sheet_names(workbook):
+    """Return generated sheets in the same order as the synthetic categories."""
+    ordered_names = []
+    if SOURCE_SHEET in workbook.sheetnames:
+        ordered_names.append(SOURCE_SHEET)
+
+    for config in CATEGORIES.values():
+        for sheet_name in (config.get("data_sheet"), config.get("target_sheet")):
+            if sheet_name and sheet_name in workbook.sheetnames and sheet_name not in ordered_names:
+                ordered_names.append(sheet_name)
+    return ordered_names
+
+
+def _reorder_generated_sheets(workbook):
+    """Keep each synthetic data sheet adjacent to its pivot result."""
+    ordered_names = _ordered_generated_sheet_names(workbook)
+    if not ordered_names:
+        return
+
+    ordered_sheets = [workbook[sheet_name] for sheet_name in ordered_names]
+    other_sheets = [
+        worksheet for worksheet in workbook._sheets
+        if worksheet.title not in ordered_names
+    ]
+    workbook._sheets = ordered_sheets + other_sheets
+
+
 # The public demo defaults to a fully synthetic category configuration.
 ACTIVE_CATEGORY = "Demo Category A"
 
@@ -208,6 +236,16 @@ def _com_try_open(excel, path):
         return None
 
 
+def _pivot_source_data_reference(workbook_name, source_name, total_cols, total_rows):
+    """Build the one contiguous external R1C1 source used by PivotCache."""
+    safe_workbook_name = str(workbook_name).replace("'", "''")
+    safe_source_name = str(source_name).replace("'", "''")
+    return (
+        f"'[{safe_workbook_name}]{safe_source_name}'!"
+        f"R1C1:R{total_rows + 1}C{total_cols}"
+    )
+
+
 def _com_create_pivot(
     wb_com, total_cols, total_rows, source_name, target_sheet, pivot_table_name,
     row_fields=None, value_field=None, value_name=None,
@@ -216,42 +254,55 @@ def _com_create_pivot(
     row_fields = row_fields or ROW_FIELDS
     value_field = value_field or VALUE_FIELD
     value_name = value_name or VALUE_NAME
-    # 删除旧透视表 Sheet
-    for s in list(wb_com.Sheets):
-        if s.Name == target_sheet:
-            s.Delete()
-            break
+    stage = "删除原有透视表"
+    try:
+        for sheet in list(wb_com.Sheets):
+            if sheet.Name == target_sheet:
+                sheet.Delete()
+                break
 
-    # 定位数据源区域
-    src_ws = wb_com.Sheets(source_name)
-    data_range = src_ws.Range(f"A1:{_col_letter(total_cols)}{total_rows + 1}")
+        # PivotCache must not infer its source from the active multi-selection.
+        stage = "定位单一数据源"
+        source_sheet = wb_com.Sheets(source_name)
+        source_sheet.Activate()
+        source_data = _pivot_source_data_reference(
+            wb_com.Name,
+            source_name,
+            total_cols,
+            total_rows,
+        )
 
-    # 在 Sheet1 右侧新建透视表 Sheet
-    sheet1 = wb_com.Sheets(SOURCE_SHEET)
-    new_ws = wb_com.Sheets.Add(After=sheet1)
-    new_ws.Name = target_sheet
+        stage = "新建透视表工作表"
+        new_ws = wb_com.Sheets.Add(After=source_sheet)
+        new_ws.Name = target_sheet
 
-    # 创建数据透视表缓存
-    pivot_cache = wb_com.PivotCaches().Create(
-        SourceType=XlDatabase, SourceData=data_range, Version=XlPivotTableVersion15
-    )
+        stage = "创建透视表缓存"
+        pivot_cache = wb_com.PivotCaches().Create(
+            SourceType=XlDatabase,
+            SourceData=source_data,
+            Version=XlPivotTableVersion15,
+        )
 
-    # 在工作表上创建透视表
-    pivot_table = pivot_cache.CreatePivotTable(
-        TableDestination=new_ws.Cells(1, 1), TableName=pivot_table_name
-    )
+        stage = "写入透视表"
+        pivot_table = pivot_cache.CreatePivotTable(
+            TableDestination=new_ws.Cells(1, 1), TableName=pivot_table_name
+        )
 
-    # 添加行字段（层级顺序）
-    for i, field_name in enumerate(row_fields, start=1):
-        pf = pivot_table.PivotFields(field_name)
-        pf.Orientation = XlRowField
-        pf.Position = i
+        stage = "配置行字段"
+        for i, field_name in enumerate(row_fields, start=1):
+            field = pivot_table.PivotFields(field_name)
+            field.Orientation = XlRowField
+            field.Position = i
 
-    # 添加值字段（求和）
-    pivot_table.AddDataField(
-        pivot_table.PivotFields(value_field), value_name, XlSum
-    )
-    return new_ws, pivot_table
+        stage = "配置汇总字段"
+        pivot_table.AddDataField(
+            pivot_table.PivotFields(value_field), value_name, XlSum
+        )
+        return new_ws, pivot_table
+    except Exception as exc:
+        raise RuntimeError(
+            f"透视表「{target_sheet}」在{stage}时失败：{exc}"
+        ) from exc
 
 
 def _summary_pivot_count_expression(description):
@@ -329,16 +380,16 @@ def _apply_summary_layout(worksheet):
 
 def _build_plant_mapping(_log):
     """
-    读取 工厂清单 7.XLSX，建立 Plant → (区域, 分公司) 映射字典。
-    按列位置读取：A=Plant, J=区域(英文), K=分公司(拼音)
+    读取本地演示站点映射表，建立站点代码到区域/分支的映射字典。
+    按固定列位置读取站点代码、区域和分支字段。
     （由独立的「匹配区域/分公司」按钮调用，品类无关）
     """
     import pandas as pd
-    _log("正在读取工厂清单...")
+    _log("正在读取演示站点映射表...")
     df_factory = pd.read_excel(FACTORY_FILE, sheet_name=0, header=None)
 
     # ── 诊断：打印前 3 行原始数据 ──
-    debug_lines = ["[诊断] 工厂清单前 3 行 A/J/K 列原始值:"]
+    debug_lines = ["[诊断] 演示站点映射表前 3 行关键列原始值:"]
     for i in range(min(3, len(df_factory))):
         a_raw = repr(df_factory.iloc[i, 0])
         j_raw = repr(df_factory.iloc[i, 9])
@@ -369,7 +420,7 @@ def _build_plant_mapping(_log):
 
 def apply_factory_mapping(status_callback=None):
     """
-    独立功能：读取工厂清单，在 Sheet1 插入/更新「区域」「分公司」列。
+    独立功能：读取演示站点映射表，在 Sheet1 插入/更新「区域」「分公司」列。
     品类无关，运行一次即可。演示用户可在开始任何品类流程前执行此步骤。
     """
     import openpyxl
@@ -379,13 +430,13 @@ def apply_factory_mapping(status_callback=None):
     if not os.path.exists(EXCEL_FILE):
         return False, f"找不到主数据文件：\n{EXCEL_FILE}"
     if not os.path.exists(FACTORY_FILE):
-        return False, f"找不到工厂清单文件：\n{FACTORY_FILE}"
+        return False, f"找不到演示站点映射文件：\n{FACTORY_FILE}"
 
-    # ── 1. 读工厂清单 ──
+    # ── 1. 读演示站点映射表 ──
     try:
         plant_map, factory_debug = _build_plant_mapping(_log)
     except Exception as e:
-        return False, f"读取工厂清单失败：\n{e}"
+        return False, f"读取演示站点映射表失败：\n{e}"
 
     # ── 2. 打开 Sheet1 ──
     wb = openpyxl.load_workbook(EXCEL_FILE)
@@ -592,6 +643,7 @@ def _enhance_and_filter(cfg, _log):
     for ri, row in df_filtered.iterrows():
         for ci, val in enumerate(row, 1):
             ds.cell(ri + 2, ci, val)
+    _reorder_generated_sheets(wb2)
     wb2.save(EXCEL_FILE)
     wb2.close()
 
@@ -736,7 +788,7 @@ def match_pm_tracking_data(category=None):
 
     ws = wb[target_sheet]
 
-    e2e_col = None
+    project_name_col = None
     order_value_col = None   # 订单净值（列B "求和项:订单净值"）
     po_col = None             # 采购凭证
     price_col = None
@@ -749,7 +801,7 @@ def match_pm_tracking_data(category=None):
     for col in range(1, ws.max_column + 1):
         val = str(ws.cell(1, col).value or "").strip()
         if val == "项目管理系统项目名称":
-            e2e_col = col
+            project_name_col = col
         elif val == "求和项:订单净值":
             order_value_col = col
         elif val == "采购凭证":
@@ -767,7 +819,7 @@ def match_pm_tracking_data(category=None):
         elif val == APPROVAL_AMOUNT_COL:
             approval_amount_col = col
 
-    if e2e_col is None:
+    if project_name_col is None:
         wb.close()
         return False, f"「{target_sheet}」中未找到「项目管理系统项目名称」列，请先点击「添加扩展列」按钮。"
     if order_value_col is None:
@@ -795,7 +847,7 @@ def match_pm_tracking_data(category=None):
     # ── 2. 收集待匹配的项目管理系统项目名称和采购凭证（跳过空值）──
     project_names = []  # (row_number, project_name, po_number)
     for row in range(2, ws.max_row + 1):
-        val = str(ws.cell(row, e2e_col).value or "").strip()
+        val = str(ws.cell(row, project_name_col).value or "").strip()
         if not val:
             continue
         if requires_standard_template_support_file:
@@ -1814,7 +1866,7 @@ def generate_pivot_table(category=None, status_callback=None):
     品类驱动的完整工作流：
       1. 按品类配置：插入品类专属列（差异化预处理）
       2. pandas 筛选物料 → 写入品类数据 Sheet
-      3. COM 生成原生透视表 → 品类透视表 Sheet（Sheet1 右侧）
+      3. COM 生成原生透视表 → 紧邻本品类数据 Sheet
     """
     _log = lambda msg: status_callback and status_callback(msg)
     cfg = _cfg(category)
@@ -1909,7 +1961,7 @@ def generate_pivot_table(category=None, status_callback=None):
         f"筛选后数据行数：{total_rows}\n"
         f"行层级：{' → '.join(pivot_row_fields)}\n"
         f"值字段：{pivot_value_name}（求和）\n"
-        f"目标 Sheet：\"{target_sheet}\"（紧邻 Sheet1 右侧）\n\n"
+        f"目标 Sheet：\"{target_sheet}\"（紧邻\"{data_sheet}\"右侧）\n\n"
         f"Sheet1 原有格式完整保留，仅新增了品类相关列。\n"
     )
     if is_summary_layout_workflow:
@@ -2038,7 +2090,7 @@ class PivotTableApp:
 
         selected_file = filedialog.askopenfilename(
             parent=self.root,
-            title="选择本月采购记录",
+            title="选择演示采购记录（需包含 Sheet1）",
             initialdir=SCRIPT_DIR,
             filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")],
         )
@@ -2072,7 +2124,7 @@ class PivotTableApp:
 
         self._purchase_record_path = _set_active_purchase_record(selected_file)
         self.lbl_current_record.config(
-            text=f"当前采购记录：{os.path.basename(self._purchase_record_path)}"
+            text=f"当前演示采购记录：{os.path.basename(self._purchase_record_path)}"
         )
         # 网页查询/回填模块拥有独立的模块全局变量，必须同步为同一个文件。
         import web_query
@@ -2082,6 +2134,10 @@ class PivotTableApp:
             "#27ae60",
         )
         return True
+
+    def _on_select_purchase_record_click(self):
+        """Allow a user to select the demo workbook before starting a task."""
+        self._ensure_purchase_record_selected()
 
     def _is_content_widget(self, widget):
         """判断事件来源是否位于可滚动的工作台正文中。"""
@@ -2132,7 +2188,7 @@ class PivotTableApp:
             self.btn.config(text=f"① 生成{label}数据")
             self.btn_air_price.config(text=f"② 填充{label}价格并计算 Saving")
             return
-        self.btn.config(text=f"① 生成{label}透视表")
+        self.btn.config(text=f"① 生成{label}数据与透视表")
         self.btn_extra.config(text=f"② 添加扩展列")
         self.btn_web.config(text="③ 打开网站查询")
         self.btn_retry_missing.config(text="↻ 补查缺失 PO")
@@ -2144,26 +2200,25 @@ class PivotTableApp:
     def _update_hint_labels(self):
         cfg = CATEGORIES[self.active_category]
         label = cfg["label"]
-        materials = cfg["filter_materials"]
         if cfg.get("workflow") == "summary_layout":
             self.hint1.config(
-                text=f"筛选物料 {materials} → 新增描述 / PO数量 → 生成「{cfg['target_sheet']}」原生透视表与 Saving 计算"
+                text="筛选合成物料 → 生成演示数据表、原生透视表与汇总计算"
             )
             return
         if cfg.get("workflow") == "data_price":
             self.hint1.config(
-                text=f"筛选物料 {materials} → 生成「{cfg['data_sheet']}」；本品类不创建透视表"
+                text="筛选合成物料 → 生成演示数据表；本品类不创建透视表"
             )
             self.hint_air_price.config(
                 text="短文本精确匹配演示价格表描述列；读取两列合成价格并计算 Saving。"
             )
             return
-        self.hint1.config(text=f"筛选物料 {materials} → COM 引擎生成原生透视表")
-        self.hint2.config(text=f"在{label}透视表右侧追加项目管理系统项目名称 / WBS / Price / PlanCost 等 10 列空白表头")
+        self.hint1.config(text="筛选合成物料 → 生成演示数据表和原生透视表")
+        self.hint2.config(text=f"在{label}透视表右侧追加项目、WBS、价格与核对字段")
         self.hint3.config(
-            text="③ 首次查询下载全部 PO；若日志提示缺失，点击右侧「补查缺失 PO」仅重查缺失项（也可扫描旧运行结果）。"
+            text="通过本地授权门户按采购凭证查询和下载附件；补查仅重试下载失败的采购凭证"
         )
-        self.hint_backfill.config(text=f"读取「{label}」已下载附件 → 解析审批价格 / 计算差异 → 写回{label}透视表")
+        self.hint_backfill.config(text=f"读取「{label}」已下载附件 → 解析可确认字段并写回{label}透视表")
         content_display = cfg.get("content_filter_display", cfg["content_filter"])
         self.hint4.config(text=f"项目名称模糊匹配 → Content 筛选「{content_display}」→ 计算总 saving / 订单是否下完")
 
@@ -2298,11 +2353,16 @@ class PivotTableApp:
         )
         self.lbl_workbench_title.pack(side=tk.LEFT)
         self.lbl_current_record = tk.Label(
-            brand, text="当前采购记录：未选择（首次操作时选择）",
+            brand, text="当前演示采购记录：未选择",
             font=("Microsoft YaHei", 9), fg="#b8d4eb", bg="#102a43",
             anchor=tk.W,
         )
         self.lbl_current_record.pack(side=tk.LEFT, padx=(16, 0))
+        self.btn_select_purchase_record = ttk.Button(
+            brand, text="选择演示采购记录", bootstyle="secondary-outline",
+            padding=(8, 3), command=self._on_select_purchase_record_click,
+        )
+        self.btn_select_purchase_record.pack(side=tk.LEFT, padx=(10, 0))
 
         # 内容区可滚动：小屏或高 DPI 缩放时不会再为了容纳所有卡片把窗口
         # 顶出屏幕，窗口依然可以任意拖动和缩放。
@@ -2440,21 +2500,24 @@ class PivotTableApp:
         self.btn_factory = _btn(
             c1, "🔧 匹配区域/分公司", "warning", self._on_factory_click,
         )
-        self.hint_factory = _hint(c1, "读取工厂清单 → Sheet1 插入区域/分公司列 → 按 Plant 填值（跑一次即可）")
+        self.hint_factory = _hint(
+            c1,
+            "使用本地演示映射表，在 Sheet1 中插入区域/分公司列并按站点填值",
+        )
 
         self.c1_sep_factory = _sep(c1)
 
         self.btn = _btn(
-            c1, f"① 生成{cfg_default['label']}透视表", "success", self._on_click,
+            c1, f"① 生成{cfg_default['label']}数据与透视表", "success", self._on_click,
         )
-        self.hint1 = _hint(c1, f"筛选物料 {cfg_default['filter_materials']} → COM 引擎生成原生透视表")
+        self.hint1 = _hint(c1, "筛选合成物料 → 生成演示数据表和原生透视表")
 
         self.c1_sep_main = _sep(c1)
 
         self.btn_extra = _btn(
             c1, "② 添加扩展列", "primary", self._on_extra_click,
         )
-        self.hint2 = _hint(c1, f"在{cfg_default['label']}透视表右侧追加项目管理系统项目名称 / WBS / Price / PlanCost 等 10 列空白表头")
+        self.hint2 = _hint(c1, f"在{cfg_default['label']}透视表右侧追加项目、WBS、价格与核对字段")
         self.c1_bottom_spacer = tk.Frame(c1, bg=CARD_BG, height=10)
         self.c1_bottom_spacer.pack()
 
@@ -2493,7 +2556,7 @@ class PivotTableApp:
         )
         self.hint3 = _hint(
             c2,
-            "③ 首次查询下载全部 PO；若日志提示缺失，点击右侧「补查缺失 PO」仅重查缺失项（也可扫描旧运行结果）。",
+            "通过本地授权门户按采购凭证查询和下载附件；补查仅重试下载失败的采购凭证",
         )
 
         self.c2_sep_web = _sep(c2)
@@ -3022,7 +3085,7 @@ class PivotTableApp:
         elif cfg.get("workflow") == "data_price":
             button_text = f"① 生成{label}数据"
         else:
-            button_text = f"① 生成{label}透视表"
+            button_text = f"① 生成{label}数据与透视表"
         self.btn.config(state=tk.NORMAL, text=button_text)
         if success:
             self._update_status(f"[{label}] 生成成功！", "#27ae60")
