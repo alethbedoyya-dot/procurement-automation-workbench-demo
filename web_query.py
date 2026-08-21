@@ -31,7 +31,12 @@ EXCEL_FILE = os.path.join(SCRIPT_DIR, "demo_purchase_records.xlsx")
 TARGET_SHEET = "DEMO_CATEGORY_A_PIVOT"
 HOME_URL = ""
 SEARCH_URL = ""
-AUTH_FILE = os.path.join(SCRIPT_DIR, "auth.json")
+USER_STATE_ROOT = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "ProcurementAutomationWorkbenchDemo",
+)
+AUTH_STATE_FILE = os.path.join(USER_STATE_ROOT, "auth_state.json")
+AUTH_META_FILE = os.path.join(USER_STATE_ROOT, "auth_state.meta.json")
 RUN_LOG_FILE = os.path.join(SCRIPT_DIR, "automation_run_log.txt")
 BACKFILL_RUN_LOG_FILE = os.path.join(SCRIPT_DIR, "backfill_run_log.txt")
 DOWNLOADS_ROOT_DIR = os.path.join(SCRIPT_DIR, "downloads")
@@ -49,6 +54,55 @@ def _configure_web_urls():
     global HOME_URL, SEARCH_URL
     HOME_URL, SEARCH_URL = load_web_urls()
     return HOME_URL, SEARCH_URL
+
+
+def _auth_identity():
+    """Return the local Windows identity allowed to reuse a saved session."""
+    return {
+        "computer": os.environ.get("COMPUTERNAME", "").strip().lower(),
+        "user": os.environ.get("USERNAME", "").strip().lower(),
+    }
+
+
+def _saved_auth_is_local():
+    """Only reuse state saved by the current Windows user on this computer."""
+    if not os.path.exists(AUTH_STATE_FILE) or not os.path.exists(AUTH_META_FILE):
+        return False
+    try:
+        with open(AUTH_META_FILE, "r", encoding="utf-8") as file_obj:
+            metadata = json.load(file_obj)
+        return metadata == _auth_identity()
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _remove_saved_auth():
+    for path in (AUTH_STATE_FILE, AUTH_META_FILE):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _save_local_auth(context):
+    """Atomically save a session state that cannot be reused by another user."""
+    os.makedirs(USER_STATE_ROOT, exist_ok=True)
+    state_temp = AUTH_STATE_FILE + ".tmp"
+    meta_temp = AUTH_META_FILE + ".tmp"
+    try:
+        context.storage_state(path=state_temp)
+        with open(meta_temp, "w", encoding="utf-8") as file_obj:
+            json.dump(_auth_identity(), file_obj, ensure_ascii=False)
+        os.replace(state_temp, AUTH_STATE_FILE)
+        os.replace(meta_temp, AUTH_META_FILE)
+    finally:
+        for path in (state_temp, meta_temp):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
 OCR_TIMEOUT = 60
 TARGET_MSG_PREFIXES = ("standard_template",)
 APPROVAL_PRICE_LABEL = "\u5ba1\u6279\u4ef7\u683c"
@@ -275,7 +329,11 @@ def retry_missing_pos(
         failed_pos=(manifest or {}).get("failed_pos", []),
     )
     missing_download_pos = audit["missing_pos"]
-    missing_wbs_pos = _find_pos_with_missing_wbs(EXCEL_FILE, ts, expected_pos)
+    missing_wbs_pos = (
+        _find_manifest_pos_with_missing_wbs(manifest, expected_pos)
+        if manifest
+        else _find_pos_with_missing_wbs(EXCEL_FILE, ts, expected_pos)
+    )
     missing_pos = _normalise_po_list(missing_download_pos + missing_wbs_pos)
     if not manifest and not audit["folder_pos"]:
         return False, "未发现历史查询记录，请先点击「③ 打开网站查询」。"
@@ -305,6 +363,22 @@ def retry_missing_pos(
     if missing_wbs_pos:
         summary += "\nWBS 补全 PO：" + "、".join(missing_wbs_pos)
     return success, summary + "\n\n" + message
+
+
+def _find_manifest_pos_with_missing_wbs(manifest, expected_pos):
+    """Return only manifest results whose WBS field is genuinely still empty."""
+    if not isinstance(manifest, dict):
+        return []
+    expected = _normalise_po_list(expected_pos)
+    expected_set = set(expected)
+    missing = set()
+    for result in manifest.get("results", []):
+        if not isinstance(result, dict):
+            continue
+        po = str(result.get("po") or "").strip()
+        if po in expected_set and not str(result.get("wbs") or "").strip():
+            missing.add(po)
+    return [po for po in expected if po in missing]
 
 
 def _save_pending_backfill_manifest(manifest):
@@ -855,43 +929,57 @@ def _click_request_id(page, context, log):
 
 # ═══════════════════ 详情页数据提取 ═══════════════════
 
+PROJECT_NAME_LABEL = "项目名称"
+PROJECT_NAME_FOLLOWING_FIELDS = (
+    "项目经理", "客户名称", "项目WBS", "WBS", "项目地址", "合同编号",
+)
+
+
+def _clean_project_name_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip(" ：:\t")
+
+
+def _trim_following_project_fields(value):
+    cleaned = _clean_project_name_text(value)
+    for field in PROJECT_NAME_FOLLOWING_FIELDS:
+        marker = re.search(rf"\s+{re.escape(field)}(?:\s|[：:])", cleaned)
+        if marker:
+            cleaned = cleaned[:marker.start()].strip()
+    return cleaned
+
+
+def _is_valid_project_name(value):
+    return bool(value and len(value) > 2 and value != PROJECT_NAME_LABEL)
+
+
+def _extract_project_name_from_body_text(body_text):
+    """Read a project-name field without dropping valid punctuation."""
+    lines = [_clean_project_name_text(line) for line in str(body_text or "").splitlines()]
+    lines = [line for line in lines if line]
+    for index, line in enumerate(lines):
+        if PROJECT_NAME_LABEL not in line:
+            continue
+        _, _, inline = line.partition(PROJECT_NAME_LABEL)
+        inline = _trim_following_project_fields(inline)
+        if _is_valid_project_name(inline):
+            return inline, "同行完整文本"
+        if index + 1 < len(lines):
+            next_line = _trim_following_project_fields(lines[index + 1])
+            if _is_valid_project_name(next_line) and PROJECT_NAME_LABEL not in next_line:
+                return next_line, "下行完整文本"
+    return None, None
+
+
 def _extract_project_name(page, log):
     """从详情页文本中提取「项目名称」字段值。"""
     try:
         body_text = page.inner_text("body")
     except Exception:
         return None
-    if not body_text:
-        return None
-
-    lines = [l.strip() for l in body_text.split("\n") if l.strip()]
-
-    # 搜索 "项目名称" 标签，取紧随其后的中文值
-    for i, line in enumerate(lines):
-        if "项目名称" not in line:
-            continue
-        # 尝试在当前行取「项目名称」之后的文本
-        m = re.search(r'项目名称\s*[：:]*\s*([\u4e00-\u9fff][\u4e00-\u9fff\w（）()\-·、，\s]+)', line)
-        if m:
-            val = m.group(1).strip()
-            if len(val) > 2:
-                log(f"  项目名称（同行）: {val[:60]}")
-                return val
-        # 尝试下一行
-        if i + 1 < len(lines):
-            next_line = lines[i + 1].strip()
-            if next_line and not next_line.startswith("项目") and any('\u4e00' <= c <= '\u9fff' for c in next_line):
-                log(f"  项目名称（下行）: {next_line[:60]}")
-                return next_line
-
-    # 兜底：正则搜索
-    m = re.search(r'项目名称\s*[：:]*\s*([\u4e00-\u9fff][\u4e00-\u9fff\w（）()\-·、，]+)', body_text)
-    if m:
-        val = m.group(1).strip()
-        if len(val) > 2:
-            log(f"  项目名称（正则）: {val[:60]}")
-            return val
-
+    value, source = _extract_project_name_from_body_text(body_text)
+    if value:
+        log(f"  项目名称（{source}）: {value[:60]}")
+        return value
     log("  ⚠ 未提取到项目名称")
     return None
 
@@ -2727,16 +2815,21 @@ def query_and_download_attachments(
         )
 
         context_kwargs = {"no_viewport": True, "accept_downloads": True}
-        if os.path.exists(AUTH_FILE):
+        if os.path.exists(AUTH_STATE_FILE) and _saved_auth_is_local():
             log("检测到已保存的登录状态，尝试自动登录...")
             try:
-                context = browser.new_context(**{**context_kwargs, "storage_state": AUTH_FILE})
+                context = browser.new_context(
+                    **{**context_kwargs, "storage_state": AUTH_STATE_FILE}
+                )
                 log("已加载登录状态。")
             except Exception:
-                os.remove(AUTH_FILE)
+                _remove_saved_auth()
                 context = browser.new_context(**context_kwargs)
                 log("登录状态文件已过期，需要重新登录。")
         else:
+            if os.path.exists(AUTH_STATE_FILE):
+                _remove_saved_auth()
+                log("已忽略其他 Windows 用户保存的登录状态。")
             context = browser.new_context(**context_kwargs)
 
         page = context.new_page()
@@ -2759,7 +2852,7 @@ def query_and_download_attachments(
                     timeout=300000
                 )
                 log("✅ 登录成功！正在保存登录状态...")
-                context.storage_state(path=AUTH_FILE)
+                _save_local_auth(context)
                 log("登录状态已保存。")
                 time.sleep(2)
             except Exception:
@@ -2877,7 +2970,11 @@ def query_and_download_attachments(
             prefix = "补查" if is_recovery_run else "网页阶段"
             log(f"✅ {prefix}完成：本轮成功 {success_count} / 失败 {fail_count} / 总数 {total}")
 
-        auth_info = "登录状态已保存，下次自动登录。" if os.path.exists(AUTH_FILE) else ""
+        try:
+            _save_local_auth(context)
+        except Exception as error:
+            log(f"⚠ 登录状态刷新失败：{error}")
+        auth_info = "登录状态已保存，下次自动登录。" if _saved_auth_is_local() else ""
         if stopped:
             summary_prefix = "⏹ 查询已按请求停止"
         elif is_recovery_run:

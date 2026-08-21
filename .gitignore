@@ -3,6 +3,7 @@ config.local.json
 config.*.local.json
 auth.json
 auth-*.json
+auth_state*.json
 .auth/
 .sessions/
 .browser-state/
